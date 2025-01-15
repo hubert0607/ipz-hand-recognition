@@ -7,17 +7,71 @@ import itertools
 import asyncio
 import json
 import websockets
+from concurrent.futures import ThreadPoolExecutor
+import threading
+import multiprocessing
 
+
+threads_numbers = multiprocessing.cpu_count()
 
 global detected_persons
 detected_persons = {}
 
+# Przechowywanie klasyfikatorów dla każdego wątku
+thread_local = threading.local()
+
+def get_thread_classifier():
+    """
+    Tworzy lub zwraca istniejący klasyfikator dla aktualnego wątku
+    """
+    if not hasattr(thread_local, 'classifier'):
+        thread_local.classifier = KeyPointClassifier()
+    return thread_local.classifier
+
+def process_single_hand(rgb_person_frame, hand_landmarks, frame_shape, padded_x1, padded_y1, static_gesture_labels):
+    """
+    Pomocnicza funkcja do przetwarzania pojedynczej ręki w osobnym wątku
+    """
+    # Pobierz klasyfikator dla aktualnego wątku
+    keypoint_classifier = get_thread_classifier()
+    
+    hand_points = []
+    for point in hand_landmarks.landmark:
+        x = int(point.x * frame_shape[1] + padded_x1)
+        y = int(point.y * frame_shape[0] + padded_y1)
+        hand_points.append([x, y])
+
+    # Preprocessing landmarków
+    pre_processed_landmarks = []
+    temp_landmark_list = copy.deepcopy(hand_points)
+    
+    # Konwersja na względne współrzędne
+    base_x, base_y = temp_landmark_list[0][0], temp_landmark_list[0][1]
+    for i in range(len(temp_landmark_list)):
+        temp_landmark_list[i][0] = temp_landmark_list[i][0] - base_x
+        temp_landmark_list[i][1] = temp_landmark_list[i][1] - base_y
+
+    # Konwersja na listę 1D
+    temp_landmark_list = list(itertools.chain.from_iterable(temp_landmark_list))
+
+    # Normalizacja
+    max_value = max(list(map(abs, temp_landmark_list)))
+    pre_processed_landmarks = [n / max_value if max_value != 0 else 0 for n in temp_landmark_list]
+
+    # Klasyfikacja gestu używając klasyfikatora dla tego wątku
+    hand_sign_id = keypoint_classifier(pre_processed_landmarks)
+    hand_sign_text = static_gesture_labels[hand_sign_id]
+
+    return {
+        'landmarks': hand_points,
+        'normalized_landmarks': pre_processed_landmarks,
+        'gesture': hand_sign_text,
+    }
+
 class Detection:
     def __init__(self):
-        #zmien to potem na cuda
         self.person_detector = YOLO('yolov8n.pt').to('mps')
-        #padding zostal dodany dlatego ze yolo czasami ucinalo delikatnie koncowki palcu kiedy ramiona byly szeroko wyprostowane
-        self.padding_percent = 0.05  # 5% padding
+        self.padding_percent = 0.05
 
         self.mp_hands = mp.solutions.hands
         self.hands = self.mp_hands.Hands(
@@ -27,9 +81,10 @@ class Detection:
             model_complexity=1
         )
 
-        self.keypoint_classifier = KeyPointClassifier()
         self.static_gesture_labels = {0:'Open', 1:'Close', 2:'OK', 3:'Peace Sign'}
-
+        
+        # Inicjalizacja puli wątków
+        self.thread_pool = ThreadPoolExecutor(max_workers=threads_numbers)
 
     def detect(self, frame):
         results_dict = {}
@@ -39,7 +94,7 @@ class Detection:
         for person_id, box in enumerate(detected_objects.boxes.data.tolist()):
             x1, y1, x2, y2, score, class_id = box
             
-            if int(class_id) != 0:  # Skip if not a person
+            if int(class_id) != 0:  # Pomijamy, jeśli to nie jest osoba
                 continue
 
             padded_x1, padded_y1, padded_x2, padded_y2 = self._add_padding_to_box([x1, y1, x2, y2], frame)
@@ -51,14 +106,12 @@ class Detection:
             rgb_person_frame = cv2.cvtColor(person_frame, cv2.COLOR_BGR2RGB)
 
             person = {}
-            person['box']= [x1, y1, x2, y2]
+            person['box'] = [x1, y1, x2, y2]
             person["hands"] = self._find_hands_landmarks(rgb_person_frame, padded_x1, padded_y1)
-
 
             results_dict[f'person_{person_id}'] = person
 
         return results_dict
-
 
     def _add_padding_to_box(self, box, frame):
         frame_height, frame_width = frame.shape[:2]
@@ -74,58 +127,39 @@ class Detection:
         
         return x1, y1, x2, y2
 
-
-    def _find_hands_landmarks(self,rgb_person_frame, padded_x1, padded_y1):
+    def _find_hands_landmarks(self, rgb_person_frame, padded_x1, padded_y1):
         hands_results = self.hands.process(rgb_person_frame)
         hands = {}
 
         if hands_results.multi_hand_landmarks:
-            for hand_id, hand_landmarks in enumerate(hands_results.multi_hand_landmarks):
-                hand_points = []
-                for point in hand_landmarks.landmark:
-                    # Convert relative coordinates to absolute
-                    x = int(point.x * rgb_person_frame.shape[1] + padded_x1)
-                    y = int(point.y * rgb_person_frame.shape[0] + padded_y1)
-                    hand_points.append([x, y])
+            # Przetwarzanie rąk w osobnych wątkach
+            futures = []
+            for hand_landmarks in hands_results.multi_hand_landmarks:
+                future = self.thread_pool.submit(
+                    process_single_hand,
+                    rgb_person_frame,
+                    hand_landmarks,
+                    rgb_person_frame.shape,
+                    padded_x1,
+                    padded_y1,
+                    self.static_gesture_labels
+                )
+                futures.append(future)
 
-                pre_processed_landmarks = self._pre_process_landmark(hand_points)
-                hand_sign_id = self.keypoint_classifier(pre_processed_landmarks)
-                hand_sign_text = self.static_gesture_labels[hand_sign_id]
-                
-                
-                hands[f'hand_{hand_id}'] = {
-                    'landmarks': hand_points,
-                    'normalized_landmarks': pre_processed_landmarks,
-                    'gesture': hand_sign_text,
-                }
+            # Zbieranie wyników
+            for hand_id, future in enumerate(futures):
+                try:
+                    result = future.result()
+                    hands[f'hand_{hand_id}'] = result
+                except Exception as e:
+                    print(f"Error processing hand {hand_id}: {e}")
+
         return hands
 
+    def __del__(self):
+        self.thread_pool.shutdown()
 
-    def _pre_process_landmark(self, landmark_list):
-        temp_landmark_list = copy.deepcopy(landmark_list)
-
-        # Convert to relative coordinates
-        base_x, base_y = 0, 0
-        for index, landmark_point in enumerate(temp_landmark_list):
-            if index == 0:
-                base_x, base_y = landmark_point[0], landmark_point[1]
-
-            temp_landmark_list[index][0] = temp_landmark_list[index][0] - base_x
-            temp_landmark_list[index][1] = temp_landmark_list[index][1] - base_y
-
-        # Convert to 1D list
-        temp_landmark_list = list(itertools.chain.from_iterable(temp_landmark_list))
-
-        # Normalize
-        max_value = max(list(map(abs, temp_landmark_list)))
-
-        def normalize_(n):
-            return n / max_value if max_value != 0 else 0
-
-        temp_landmark_list = list(map(normalize_, temp_landmark_list))
-
-        return temp_landmark_list
-
+# Pozostała część kodu (draw_landmarks, send_data, websocket_handler, main_async) pozostaje bez zmian...
 
 
 def draw_landmarks(image, hand_data):
@@ -185,10 +219,12 @@ async def send_data(websocket):
     except websockets.exceptions.ConnectionClosedError:
         print("Connection closed by the client.")
 
+
 async def websocket_handler(websocket, path):
     """Handle incoming WebSocket connections."""
     print(f"Client connected: {path}")
     await send_data(websocket)
+
 
 async def main_async():
     detection = Detection()
@@ -231,7 +267,6 @@ async def main_async():
     cv2.destroyAllWindows()
     server.close()
     await server.wait_closed()
-    
 
 
 if __name__ == '__main__':
