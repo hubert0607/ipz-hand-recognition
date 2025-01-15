@@ -1,0 +1,13 @@
+[project]
+name = "new-hand-recognition"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "mediapipe>=0.10.20",
+    "numpy>=1.26.4",
+    "tensorflow>=2.18.0",
+    "ultralytics>=8.3.58",
+    "websockets>=14.1",
+]
