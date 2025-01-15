@@ -2,13 +2,16 @@
 # -*- coding: utf-8 -*-
 import numpy as np
 import tensorflow as tf
+import multiprocessing
 
+
+threads_numbers = multiprocessing.cpu_count()
 
 class KeyPointClassifier(object):
     def __init__(
         self,
         model_path='keypoint_classifier.tflite',
-        num_threads=8,
+        num_threads=threads_numbers,
     ):
         self.interpreter = tf.lite.Interpreter(model_path=model_path,
                                                num_threads=num_threads)
@@ -32,5 +35,4 @@ class KeyPointClassifier(object):
         result = self.interpreter.get_tensor(output_details_tensor_index)
 
         result_index = np.argmax(np.squeeze(result))
-        print("xd")
         return result_index

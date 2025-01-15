@@ -28,7 +28,7 @@ class Detection:
         )
 
         self.keypoint_classifier = KeyPointClassifier()
-        self.static_gesture_labels = ['Open', 'Close', 'OK', 'Peace Sign']
+        self.static_gesture_labels = {0:'Open', 1:'Close', 2:'OK', 3:'Peace Sign'}
 
 
     def detect(self, frame):
@@ -49,8 +49,9 @@ class Detection:
                 continue
 
             rgb_person_frame = cv2.cvtColor(person_frame, cv2.COLOR_BGR2RGB)
-                        
-            person = {'box': [x1, y1, x2, y2]}
+
+            person = {}
+            person['box']= [x1, y1, x2, y2]
             person["hands"] = self._find_hands_landmarks(rgb_person_frame, padded_x1, padded_y1)
 
 
@@ -89,7 +90,7 @@ class Detection:
 
                 pre_processed_landmarks = self._pre_process_landmark(hand_points)
                 hand_sign_id = self.keypoint_classifier(pre_processed_landmarks)
-                hand_sign_text = self.static_gesture_labels[min(hand_sign_id, len(self.static_gesture_labels)-1)]
+                hand_sign_text = self.static_gesture_labels[hand_sign_id]
                 
                 
                 hands[f'hand_{hand_id}'] = {
@@ -201,40 +202,37 @@ async def main_async():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
-    try:
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
 
-            detected_persons = detection.detect(frame)
+        detected_persons = detection.detect(frame)
+        
+        for person in detected_persons.values():
+            # Draw person box
+            box = person['box']
+            x1, y1, x2, y2 = map(int, box)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
             
-            for person in detected_persons.values():
-                # Draw person box
-                box = person['box']
-                x1, y1, x2, y2 = map(int, box)
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
-                
-                # Draw hand landmarks
-                for hand_data in person['hands'].values():
-                    frame = draw_landmarks(frame, hand_data)
+            # Draw hand landmarks
+            for hand_data in person['hands'].values():
+                frame = draw_landmarks(frame, hand_data)
 
-            cv2.imshow('frame', frame)
+        cv2.imshow('frame', frame)
 
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
 
-            # Give other tasks a chance to run
-            await asyncio.sleep(0)
+        # Give other tasks a chance to run
+        await asyncio.sleep(0)
 
-    finally:
-        cap.release()
-        cv2.destroyAllWindows()
-        server.close()
-        await server.wait_closed()
+    cap.release()
+    cv2.destroyAllWindows()
+    server.close()
+    await server.wait_closed()
+    
 
-def main():
-    asyncio.run(main_async())
 
 if __name__ == '__main__':
-    main()
+    asyncio.run(main_async())
